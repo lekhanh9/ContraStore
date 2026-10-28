@@ -5,6 +5,7 @@
 #import <signal.h>
 #import <sys/stat.h>
 #import <limits.h>
+#import <fcntl.h>
 
 #import "ContraXPCClient.h"
 
@@ -110,10 +111,212 @@ static int runAsyncWithSpinner(NSString *message, NSTimeInterval timeout, CTAsyn
     return resultExitCode;
 }
 
+static int runAsyncWithDirectWait(NSTimeInterval timeout, CTAsyncWorkBlock work) {
+    __block BOOL isDone = NO;
+    __block int resultExitCode = 0;
+
+    work(^(int code) {
+        resultExitCode = code;
+        isDone = YES;
+    });
+
+    NSTimeInterval startTime = [NSDate timeIntervalSinceReferenceDate];
+
+    while (!isDone && !gInterrupted) {
+        @autoreleasepool {
+            [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                     beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+        }
+
+        NSTimeInterval elapsed = [NSDate timeIntervalSinceReferenceDate] - startTime;
+        if (timeout > 0 && elapsed > timeout) {
+            fprintf(stderr, "%s[-] Error:%s Operation timed out after %.0fs.\n", colRed(), colReset(), timeout);
+            return 1;
+        }
+    }
+
+    return resultExitCode;
+}
+
+#pragma mark - Realtime Log Tailer & Colored Formatting
+
+static const char *getAuthLogFilePath(void) {
+    static char sPath[PATH_MAX] = {0};
+    if (sPath[0] != '\0') return sPath;
+
+    const char *candidates[] = {
+        "/var/jb/tmp/contra_auth_debug.log",
+        "/tmp/contra_auth_debug.log",
+        "/var/tmp/contra_auth_debug.log"
+    };
+    for (int i = 0; i < 3; i++) {
+        if (access(candidates[i], F_OK) == 0) {
+            strncpy(sPath, candidates[i], sizeof(sPath) - 1);
+            return sPath;
+        }
+    }
+    if (access("/var/jb", F_OK) == 0) {
+        strncpy(sPath, "/var/jb/tmp/contra_auth_debug.log", sizeof(sPath) - 1);
+    } else {
+        strncpy(sPath, "/tmp/contra_auth_debug.log", sizeof(sPath) - 1);
+    }
+    return sPath;
+}
+
+static void printColoredLogLine(const char *rawLine) {
+    if (!rawLine || strlen(rawLine) == 0) return;
+
+    if (strstr(rawLine, "[ANISETTE]")) {
+        printf("%s%s%s", "\033[1;35m", rawLine, colReset());
+    } else if (strstr(rawLine, "[SRP-6a]")) {
+        printf("%s%s%s", "\033[1;33m", rawLine, colReset());
+    } else if (strstr(rawLine, "[GSA-HTTP]")) {
+        printf("%s%s%s", "\033[1;36m", rawLine, colReset());
+    } else if (strstr(rawLine, "[2FA-PUSH]")) {
+        printf("%s%s%s", "\033[1;31m", rawLine, colReset());
+    } else if (strstr(rawLine, "[2FA-CODE]")) {
+        printf("%s%s%s", "\033[1;32m", rawLine, colReset());
+    } else if (strstr(rawLine, "[DEV-TEAM]")) {
+        printf("%s%s%s", "\033[1;96m", rawLine, colReset());
+    } else if (strstr(rawLine, "[SESSION]")) {
+        printf("%s%s%s", "\033[1;34m", rawLine, colReset());
+    } else if (strstr(rawLine, "[AUTH]")) {
+        printf("%s%s%s", "\033[1;37m", rawLine, colReset());
+    } else {
+        printf("%s%s%s", colGray(), rawLine, colReset());
+    }
+    fflush(stdout);
+}
+
+static dispatch_source_t gLogTailerSource = NULL;
+static off_t gLogTailerOffset = 0;
+
+static void startRealtimeLogTailer(void) {
+    const char *path = getAuthLogFilePath();
+    unlink(path);
+
+    gLogTailerOffset = 0;
+    dispatch_queue_t tailerQueue = dispatch_queue_create("com.kurishu.contra.logtailer", DISPATCH_QUEUE_SERIAL);
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, tailerQueue);
+    dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC, 10 * NSEC_PER_MSEC);
+
+    dispatch_source_set_event_handler(timer, ^{
+        const char *logPath = getAuthLogFilePath();
+        int fd = open(logPath, O_RDONLY);
+        if (fd < 0) return;
+
+        struct stat st;
+        if (fstat(fd, &st) == 0 && st.st_size > gLogTailerOffset) {
+            lseek(fd, gLogTailerOffset, SEEK_SET);
+            char buffer[4096];
+            ssize_t bytesRead = 0;
+            while ((bytesRead = read(fd, buffer, sizeof(buffer) - 1)) > 0) {
+                buffer[bytesRead] = '\0';
+                gLogTailerOffset += bytesRead;
+
+                char *saveptr = NULL;
+                char *line = strtok_r(buffer, "\n", &saveptr);
+                while (line != NULL) {
+                    printColoredLogLine(line);
+                    printf("\n");
+                    line = strtok_r(NULL, "\n", &saveptr);
+                }
+            }
+        }
+        close(fd);
+    });
+
+    gLogTailerSource = timer;
+    dispatch_resume(timer);
+}
+
+static void stopRealtimeLogTailer(void) {
+    if (gLogTailerSource) {
+        dispatch_source_cancel(gLogTailerSource);
+        gLogTailerSource = NULL;
+    }
+    const char *logPath = getAuthLogFilePath();
+    int fd = open(logPath, O_RDONLY);
+    if (fd >= 0) {
+        struct stat st;
+        if (fstat(fd, &st) == 0 && st.st_size > gLogTailerOffset) {
+            lseek(fd, gLogTailerOffset, SEEK_SET);
+            char buffer[4096];
+            ssize_t bytesRead = 0;
+            while ((bytesRead = read(fd, buffer, sizeof(buffer) - 1)) > 0) {
+                buffer[bytesRead] = '\0';
+                gLogTailerOffset += bytesRead;
+
+                char *saveptr = NULL;
+                char *line = strtok_r(buffer, "\n", &saveptr);
+                while (line != NULL) {
+                    printColoredLogLine(line);
+                    printf("\n");
+                    line = strtok_r(NULL, "\n", &saveptr);
+                }
+            }
+        }
+        close(fd);
+    }
+}
+
+static void printAccountSuccessCard(NSDictionary<NSString *, id> *info) {
+    NSString *appleID = info[@"appleID"] ?: @"(Unknown)";
+    NSString *dsid = info[@"dsid"] ?: @"(Unknown)";
+    NSString *teamName = info[@"teamName"] ?: @"Personal Team";
+    NSString *teamID = info[@"teamID"] ?: @"(None)";
+    NSArray *teams = info[@"teams"];
+
+    printf("\n");
+    printf("%s┌────────────────────────────────────────────────────────────────────────┐%s\n", colCyan(), colReset());
+    printf("%s│%s  %s✅ Apple ID Authentication Successful%s                               %s│%s\n", colCyan(), colReset(), colBold(), colReset(), colCyan(), colReset());
+    printf("%s├────────────────────────────────────────────────────────────────────────┤%s\n", colCyan(), colReset());
+    printf("%s│%s  %-14s: %s%-49s%s%s│%s\n", colCyan(), colReset(), "Apple ID", colBold(), appleID.UTF8String, colReset(), colCyan(), colReset());
+    printf("%s│%s  %-14s: %-49s%s│%s\n", colCyan(), colReset(), "DSID", dsid.UTF8String, colCyan(), colReset());
+    printf("%s│%s  %-14s: %s%-49s%s%s│%s\n", colCyan(), colReset(), "Team Name", colGreen(), teamName.UTF8String, colReset(), colCyan(), colReset());
+    printf("%s│%s  %-14s: %s%-49s%s%s│%s\n", colCyan(), colReset(), "Team ID", colGreen(), teamID.UTF8String, colReset(), colCyan(), colReset());
+    printf("%s│%s  %-14s: %-49s%s│%s\n", colCyan(), colReset(), "Session", "Active (Credentials persisted to session.plist)", colCyan(), colReset());
+    printf("%s└────────────────────────────────────────────────────────────────────────┘%s\n", colCyan(), colReset());
+
+    if ([teams isKindOfClass:[NSArray class]] && teams.count > 1) {
+        printf("\n%sAll Associated Teams (%lu):%s\n", colBold(), (unsigned long)teams.count, colReset());
+        for (NSDictionary *t in teams) {
+            NSString *tid = t[@"teamId"] ?: @"";
+            NSString *tname = t[@"name"] ?: @"";
+            NSString *ttype = t[@"type"] ?: @"";
+            printf("  • %s%s%s [ID: %s%s%s] (%s)\n",
+                   colCyan(), tname.UTF8String, colReset(),
+                   colGreen(), tid.UTF8String, colReset(),
+                   ttype.UTF8String);
+        }
+    }
+    printf("\n");
+}
+
+static int cmdAuthLog(void) {
+    const char *logPath = getAuthLogFilePath();
+    FILE *f = fopen(logPath, "r");
+    if (!f) {
+        printf("%s[!] No recent authentication log found at: %s%s\n", colYellow(), logPath, colReset());
+        return 0;
+    }
+    printf("%sAuthentication Debug Trace Log (%s):%s\n", colBold(), logPath, colReset());
+    printf("%s────────────────────────────────────────────────────────────────────────%s\n", colGray(), colReset());
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        printColoredLogLine(line);
+        printf("\n");
+    }
+    fclose(f);
+    printf("%s────────────────────────────────────────────────────────────────────────%s\n", colGray(), colReset());
+    return 0;
+}
+
 #pragma mark - Commands Implementation
 
 static void printUsage(const char *progName) {
-    printf("%s%sContraStore CLI (ct)%s - Rootless App Management Tool\n\n", colBold(), colCyan(), colReset());
+    printf("%s%sContraStore CLI (ct)%s - Rootless App Management & Sideloading Tool\n\n", colBold(), colCyan(), colReset());
     printf("%sUSAGE:%s\n", colBold(), colReset());
     printf("  %s <command> [options] [arguments]\n\n", progName);
     printf("%sCOMMANDS:%s\n", colBold(), colReset());
@@ -121,14 +324,22 @@ static void printUsage(const char *progName) {
     printf("  %suninstall%s, %srm%s <bundle-id> [more...]     Uninstall an application by bundle identifier\n", colGreen(), colReset(), colGreen(), colReset());
     printf("  %slist%s, %sls%s                                List all applications managed by ContraStore\n", colGreen(), colReset(), colGreen(), colReset());
     printf("  %sinfo%s, %spaths%s <bundle-id>                 Inspect container and redirect paths for an app\n", colGreen(), colReset(), colGreen(), colReset());
+    printf("  %slogin%s [apple-id] [--debug / -v]             Authenticate with Apple ID (SRP-6a + 2FA Push)\n", colGreen(), colReset());
+    printf("  %slogout%s                                      Sign out and remove saved session\n", colGreen(), colReset());
+    printf("  %swhoami%s, %saccount%s, %sstatus%s              Show active Apple ID session and team info\n", colGreen(), colReset(), colGreen(), colReset(), colGreen(), colReset());
+    printf("  %sanisette%s                                    Test on-device genuine Anisette attestation (akd)\n", colGreen(), colReset());
+    printf("  %sauth-log%s, %slog%s                            Dump realtime authentication debug trace log\n", colGreen(), colReset(), colGreen(), colReset());
+    printf("  %ssign%s <path.ipa> [-o out.ipa] [--adhoc]      Resign an IPA package using Apple ID or Ad-Hoc\n", colGreen(), colReset());
     printf("  %sversion%s, %s-v%s, %s--version%s               Show version information\n", colGreen(), colReset(), colGreen(), colReset(), colGreen(), colReset());
     printf("  %shelp%s, %s-h%s, %s--help%s                     Show this help message\n\n", colGreen(), colReset(), colGreen(), colReset(), colGreen(), colReset());
     printf("%sEXAMPLES:%s\n", colBold(), colReset());
     printf("  %s install MyApp.ipa\n", progName);
-    printf("  %s install *.ipa\n", progName);
+    printf("  %s login user@example.com --debug\n", progName);
+    printf("  %s whoami\n", progName);
+    printf("  %s anisette\n", progName);
+    printf("  %s sign MyApp.ipa -o MyApp-signed.ipa\n", progName);
     printf("  %s uninstall com.example.app\n", progName);
-    printf("  %s list\n", progName);
-    printf("  %s info com.example.app\n\n", progName);
+    printf("  %s list\n\n", progName);
 }
 
 static void printVersion(void) {
@@ -362,6 +573,288 @@ static int cmdInfo(int argc, char *argv[]) {
     });
 }
 
+static int cmdLogin(int argc, char *argv[]) {
+    NSString *appleID = nil;
+    BOOL isDebug = NO;
+
+    for (int i = 2; i < argc; i++) {
+        NSString *arg = [NSString stringWithUTF8String:argv[i]];
+        if ([arg isEqualToString:@"--debug"] || [arg isEqualToString:@"-d"] || [arg isEqualToString:@"-v"] || [arg isEqualToString:@"--verbose"] || [arg isEqualToString:@"--debugv"] || [arg isEqualToString:@"debugv"]) {
+            isDebug = YES;
+        } else if (!appleID) {
+            appleID = arg;
+        }
+    }
+
+    if (!appleID || appleID.length == 0) {
+        printf("  %s Apple ID: ", colCyan());
+        fflush(stdout);
+        char buf[256];
+        if (fgets(buf, sizeof(buf), stdin) != NULL) {
+            appleID = [[NSString stringWithUTF8String:buf] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        }
+    }
+
+    if (!appleID || appleID.length == 0) {
+        fprintf(stderr, "%s[-] Error:%s Apple ID cannot be empty.\n", colRed(), colReset());
+        return 1;
+    }
+
+    char *pass = getpass("  Enter Password: ");
+    if (!pass || strlen(pass) == 0) {
+        fprintf(stderr, "%s[-] Error:%s Password cannot be empty.\n", colRed(), colReset());
+        return 1;
+    }
+    NSString *password = [NSString stringWithUTF8String:pass];
+
+    if (isDebug) {
+        printf("\n%s════════════════════════════════════════════════════════════════════════%s\n", colCyan(), colReset());
+        printf("%s ContraStore Authentication Engine (Fortiva / GhostSign Core)%s\n", colBold(), colReset());
+        printf(" Mode        : %sREALTIME DEBUG TRACE%s\n", colYellow(), colReset());
+        printf(" Target User : %s%s%s\n", colCyan(), appleID.UTF8String, colReset());
+        printf("%s════════════════════════════════════════════════════════════════════════%s\n\n", colCyan(), colReset());
+        startRealtimeLogTailer();
+    }
+
+    __block BOOL needs2FA = NO;
+    __block NSString *initialMsg = nil;
+
+    int status = 0;
+    if (isDebug) {
+        status = runAsyncWithDirectWait(60.0, ^(void (^done)(int code)) {
+            [[ContraXPCClient sharedClient] loginAppleID:appleID password:password completion:^(BOOL requires2FA, NSString * _Nullable message, NSError * _Nullable error) {
+                if (error) {
+                    fprintf(stderr, "\n%s[-] Authentication failed:%s %s\n",
+                            colRed(), colReset(),
+                            error.localizedDescription.UTF8String ?: "Unknown error");
+                    done(1);
+                    return;
+                }
+                if (requires2FA) {
+                    needs2FA = YES;
+                    initialMsg = message;
+                    done(0);
+                    return;
+                }
+                done(0);
+            }];
+        });
+    } else {
+        status = runAsyncWithSpinner(@"Authenticating with Apple ID (SRP-6a)...", 45.0, ^(void (^done)(int code)) {
+            [[ContraXPCClient sharedClient] loginAppleID:appleID password:password completion:^(BOOL requires2FA, NSString * _Nullable message, NSError * _Nullable error) {
+                if (error) {
+                    fprintf(stderr, "%s[-] Authentication failed:%s %s\n",
+                            colRed(), colReset(),
+                            error.localizedDescription.UTF8String ?: "Unknown error");
+                    done(1);
+                    return;
+                }
+                if (requires2FA) {
+                    needs2FA = YES;
+                    initialMsg = message;
+                    done(0);
+                    return;
+                }
+                done(0);
+            }];
+        });
+    }
+
+    if (status != 0) {
+        if (isDebug) stopRealtimeLogTailer();
+        return status;
+    }
+
+    if (needs2FA) {
+        printf("\n%s[!] Two-Factor Authentication required.%s\n", colYellow(), colReset());
+        if (initialMsg.length > 0) {
+            printf("%s[*] %s%s\n", colCyan(), initialMsg.UTF8String, colReset());
+        } else {
+            printf("%s[*] Verification code push has been triggered to your Apple devices.%s\n", colCyan(), colReset());
+        }
+        printf("%s[*] (Check your iPhone, iPad, or Mac for the Apple ID Verification Code)%s\n\n", colGray(), colReset());
+        printf("  %sEnter 6-digit verification code:%s ", colBold(), colReset());
+        fflush(stdout);
+
+        char codeBuf[64];
+        if (fgets(codeBuf, sizeof(codeBuf), stdin) == NULL) {
+            if (isDebug) stopRealtimeLogTailer();
+            fprintf(stderr, "%s[-] Failed to read verification code.%s\n", colRed(), colReset());
+            return 1;
+        }
+
+        NSString *code = [[NSString stringWithUTF8String:codeBuf] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+        int vStatus = 0;
+        if (isDebug) {
+            vStatus = runAsyncWithDirectWait(45.0, ^(void (^done)(int code)) {
+                [[ContraXPCClient sharedClient] submit2FACode:code completion:^(BOOL success, NSString * _Nullable message, NSError * _Nullable error) {
+                    if (!success || error) {
+                        fprintf(stderr, "\n%s[-] 2FA validation failed:%s %s\n",
+                                colRed(), colReset(),
+                                error.localizedDescription.UTF8String ?: "Invalid verification code.");
+                        done(1);
+                    } else {
+                        done(0);
+                    }
+                }];
+            });
+            stopRealtimeLogTailer();
+        } else {
+            vStatus = runAsyncWithSpinner(@"Validating verification code with Apple...", 45.0, ^(void (^done)(int code)) {
+                [[ContraXPCClient sharedClient] submit2FACode:code completion:^(BOOL success, NSString * _Nullable message, NSError * _Nullable error) {
+                    if (!success || error) {
+                        fprintf(stderr, "%s[-] 2FA validation failed:%s %s\n",
+                                colRed(), colReset(),
+                                error.localizedDescription.UTF8String ?: "Invalid verification code.");
+                        done(1);
+                    } else {
+                        done(0);
+                    }
+                }];
+            });
+        }
+
+        if (vStatus != 0) return vStatus;
+    } else {
+        if (isDebug) stopRealtimeLogTailer();
+    }
+
+    // Fetch and display active Developer Account Card with Team ID
+    runAsyncWithDirectWait(10.0, ^(void (^done)(int code)) {
+        [[ContraXPCClient sharedClient] fetchAccountStatusWithCompletion:^(NSDictionary<NSString *,id> * _Nullable accountInfo, NSError * _Nullable error) {
+            if (accountInfo) {
+                printAccountSuccessCard(accountInfo);
+            } else {
+                printf("%s[+] Successfully authenticated as %s%s\n", colGreen(), appleID.UTF8String, colReset());
+            }
+            done(0);
+        }];
+    });
+
+    return 0;
+}
+
+static int cmdLogout(void) {
+    return runAsyncWithSpinner(@"Signing out...", 10.0, ^(void (^done)(int code)) {
+        [[ContraXPCClient sharedClient] logoutWithCompletion:^(BOOL success, NSError * _Nullable error) {
+            if (error) {
+                fprintf(stderr, "%s[-] Logout error:%s %s\n", colRed(), colReset(), error.localizedDescription.UTF8String ?: "Unknown error");
+                done(1);
+            } else {
+                printf("%s[+] Successfully signed out. Stored session removed.%s\n", colGreen(), colReset());
+                done(0);
+            }
+        }];
+    });
+}
+
+static int cmdAccount(void) {
+    return runAsyncWithSpinner(@"Fetching Apple ID account status...", 15.0, ^(void (^done)(int code)) {
+        [[ContraXPCClient sharedClient] fetchAccountStatusWithCompletion:^(NSDictionary<NSString *,id> * _Nullable accountInfo, NSError * _Nullable error) {
+            if (error || !accountInfo) {
+                printf("%s[!] Not currently logged in with Apple ID.%s\n", colYellow(), colReset());
+                printf("    Run '%sct login <appleID>%s' to authenticate.\n", colCyan(), colReset());
+                done(0);
+                return;
+            }
+
+            printf("%sApple ID Account Status:%s\n", colBold(), colReset());
+            printf("%s────────────────────────────────────────────────────────────%s\n", colGray(), colReset());
+            NSString *appleID = accountInfo[@"appleID"] ?: @"(Unknown)";
+            NSString *dsid = accountInfo[@"dsid"] ?: @"";
+            NSString *teamName = accountInfo[@"teamName"] ?: @"";
+            NSString *teamID = accountInfo[@"teamID"] ?: @"";
+            NSString *expStr = accountInfo[@"expirationString"] ?: @"";
+            BOOL isExpired = [accountInfo[@"isExpired"] boolValue];
+
+            printf("  %-16s: %s%s%s\n", "Apple ID", colCyan(), appleID.UTF8String, colReset());
+            if (dsid.length > 0) printf("  %-16s: %s\n", "DSID", dsid.UTF8String);
+            if (teamName.length > 0) printf("  %-16s: %s\n", "Team Name", teamName.UTF8String);
+            if (teamID.length > 0) printf("  %-16s: %s\n", "Team ID", teamID.UTF8String);
+            if (expStr.length > 0) {
+                if (isExpired) {
+                    printf("  %-16s: %s%s (Expired)%s\n", "Session Status", colRed(), expStr.UTF8String, colReset());
+                } else {
+                    printf("  %-16s: %s%s (Active)%s\n", "Session Status", colGreen(), expStr.UTF8String, colReset());
+                }
+            }
+            printf("\n");
+            done(0);
+        }];
+    });
+}
+
+static int cmdAnisette(void) {
+    return runAsyncWithSpinner(@"Querying on-device Anisette from akd daemon...", 15.0, ^(void (^done)(int code)) {
+        [[ContraXPCClient sharedClient] testAnisetteWithCompletion:^(NSDictionary<NSString *,NSString *> * _Nullable headers, NSError * _Nullable error) {
+            if (error || !headers) {
+                fprintf(stderr, "%s[-] Failed to query Anisette:%s %s\n",
+                        colRed(), colReset(),
+                        error.localizedDescription.UTF8String ?: "akd daemon unreachable");
+                done(1);
+                return;
+            }
+
+            printf("%sOn-Device Anisette Attestation (AuthKit / akd):%s\n", colBold(), colReset());
+            printf("%s────────────────────────────────────────────────────────────%s\n", colGray(), colReset());
+            for (NSString *key in [headers.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+                printf("  %-24s: %s\n", key.UTF8String, headers[key].UTF8String);
+            }
+            printf("%s────────────────────────────────────────────────────────────%s\n", colGray(), colReset());
+            printf("%s[+] Status: Local akd Anisette working on-device!%s\n\n", colGreen(), colReset());
+            done(0);
+        }];
+    });
+}
+
+static int cmdSign(int argc, char *argv[]) {
+    if (argc < 3) {
+        fprintf(stderr, "%s[-] Error:%s Missing IPA path to sign.\n", colRed(), colReset());
+        fprintf(stderr, "Usage: %s sign <path.ipa> [-o output.ipa] [--adhoc]\n", argv[0]);
+        return 1;
+    }
+
+    NSString *rawPath = [NSString stringWithUTF8String:argv[2]];
+    NSString *expandedPath = [rawPath stringByExpandingTildeInPath];
+    char resolvedBuffer[PATH_MAX];
+    NSString *canonicalPath = nil;
+    if (realpath(expandedPath.fileSystemRepresentation, resolvedBuffer) != NULL) {
+        canonicalPath = [NSString stringWithUTF8String:resolvedBuffer];
+    } else {
+        canonicalPath = expandedPath.stringByStandardizingPath;
+    }
+
+    NSString *outputPath = nil;
+    BOOL isAdhoc = NO;
+
+    for (int i = 3; i < argc; i++) {
+        NSString *arg = [NSString stringWithUTF8String:argv[i]];
+        if ([arg isEqualToString:@"--adhoc"]) {
+            isAdhoc = YES;
+        } else if ([arg isEqualToString:@"-o"] || [arg isEqualToString:@"--output"]) {
+            if (i + 1 < argc) {
+                outputPath = [NSString stringWithUTF8String:argv[++i]];
+            }
+        }
+    }
+
+    NSString *filename = canonicalPath.lastPathComponent;
+    NSString *spinnerText = [NSString stringWithFormat:@"Signing %@ with Native Engine...", filename];
+
+    return runAsyncWithSpinner(spinnerText, 180.0, ^(void (^done)(int code)) {
+        [[ContraXPCClient sharedClient] resignIPA:canonicalPath outputPath:outputPath adhoc:isAdhoc completion:^(NSString * _Nullable finalPath, NSError * _Nullable error) {
+            if (error) {
+                fprintf(stderr, "%s[-] Signing failed:%s %s\n", colRed(), colReset(), error.localizedDescription.UTF8String ?: "Unknown error");
+                done(1);
+            } else {
+                printf("%s[+] Successfully signed:%s %s\n", colGreen(), colReset(), finalPath.UTF8String ?: canonicalPath.UTF8String);
+                done(0);
+            }
+        }];
+    });
+}
+
 #pragma mark - Main Entrypoint
 
 int main(int argc, char *argv[]) {
@@ -386,6 +879,18 @@ int main(int argc, char *argv[]) {
             return cmdList();
         } else if ([subcommand isEqualToString:@"info"] || [subcommand isEqualToString:@"paths"]) {
             return cmdInfo(argc, argv);
+        } else if ([subcommand isEqualToString:@"login"]) {
+            return cmdLogin(argc, argv);
+        } else if ([subcommand isEqualToString:@"logout"]) {
+            return cmdLogout();
+        } else if ([subcommand isEqualToString:@"whoami"] || [subcommand isEqualToString:@"account"] || [subcommand isEqualToString:@"status"]) {
+            return cmdAccount();
+        } else if ([subcommand isEqualToString:@"auth-log"] || [subcommand isEqualToString:@"log"]) {
+            return cmdAuthLog();
+        } else if ([subcommand isEqualToString:@"anisette"]) {
+            return cmdAnisette();
+        } else if ([subcommand isEqualToString:@"sign"]) {
+            return cmdSign(argc, argv);
         } else if ([subcommand isEqualToString:@"version"] || [subcommand isEqualToString:@"-v"] || [subcommand isEqualToString:@"--version"]) {
             printVersion();
             return 0;

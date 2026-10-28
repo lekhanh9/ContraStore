@@ -127,6 +127,96 @@
     }];
 }
 
+- (void)loginAppleID:(NSString *)appleID
+            password:(NSString *)password
+          completion:(void (^)(BOOL requires2FA, NSString * _Nullable message, NSError * _Nullable error))completion {
+    id<ContraInstallerProtocol> proxy = [[self connection] remoteObjectProxyWithErrorHandler:^(NSError * _Nonnull xpcError) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(NO, nil, xpcError);
+        });
+    }];
+    
+    [proxy loginAppleID:appleID password:password withReply:^(BOOL requires2FA, NSString * _Nullable message, NSError * _Nullable error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(requires2FA, message, error);
+        });
+    }];
+}
+
+- (void)submit2FACode:(NSString *)code
+           completion:(void (^)(BOOL success, NSString * _Nullable message, NSError * _Nullable error))completion {
+    id<ContraInstallerProtocol> proxy = [[self connection] remoteObjectProxyWithErrorHandler:^(NSError * _Nonnull xpcError) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(NO, nil, xpcError);
+        });
+    }];
+    
+    [proxy submit2FACode:code withReply:^(BOOL success, NSString * _Nullable message, NSError * _Nullable error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(success, message, error);
+        });
+    }];
+}
+
+- (void)fetchAccountStatusWithCompletion:(void (^)(NSDictionary<NSString *, id> * _Nullable accountInfo, NSError * _Nullable error))completion {
+    id<ContraInstallerProtocol> proxy = [[self connection] remoteObjectProxyWithErrorHandler:^(NSError * _Nonnull xpcError) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(nil, xpcError);
+        });
+    }];
+    
+    [proxy getAccountStatusWithReply:^(NSDictionary<NSString *, id> * _Nullable accountInfo, NSError * _Nullable error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(accountInfo, error);
+        });
+    }];
+}
+
+- (void)logoutWithCompletion:(void (^)(BOOL success, NSError * _Nullable error))completion {
+    id<ContraInstallerProtocol> proxy = [[self connection] remoteObjectProxyWithErrorHandler:^(NSError * _Nonnull xpcError) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(NO, xpcError);
+        });
+    }];
+    
+    [proxy logoutWithReply:^(BOOL success, NSError * _Nullable error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(success, error);
+        });
+    }];
+}
+
+- (void)testAnisetteWithCompletion:(void (^)(NSDictionary<NSString *, NSString *> * _Nullable headers, NSError * _Nullable error))completion {
+    id<ContraInstallerProtocol> proxy = [[self connection] remoteObjectProxyWithErrorHandler:^(NSError * _Nonnull xpcError) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(nil, xpcError);
+        });
+    }];
+    
+    [proxy testAnisetteWithReply:^(NSDictionary<NSString *, NSString *> * _Nullable headers, NSError * _Nullable error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(headers, error);
+        });
+    }];
+}
+
+- (void)resignIPA:(NSString *)ipaPath
+       outputPath:(nullable NSString *)outputPath
+            adhoc:(BOOL)adhoc
+       completion:(void (^)(NSString * _Nullable finalPath, NSError * _Nullable error))completion {
+    id<ContraInstallerProtocol> proxy = [[self connection] remoteObjectProxyWithErrorHandler:^(NSError * _Nonnull xpcError) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(nil, xpcError);
+        });
+    }];
+    
+    [proxy resignIPAAtPath:ipaPath outputPath:outputPath adhoc:adhoc withReply:^(NSString * _Nullable finalPath, NSError * _Nullable error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(finalPath, error);
+        });
+    }];
+}
+
 - (nullable NSDictionary<NSString *, NSString *> *)fetchPathsSynchronouslyForBundleID:(NSString *)bundleID {
     __block NSDictionary<NSString *, NSString *> *resultInfo = nil;
     

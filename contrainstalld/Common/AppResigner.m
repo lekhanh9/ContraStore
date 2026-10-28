@@ -32,7 +32,29 @@ extern char **environ;
     return nil;
 }
 
++ (const char *)findLdidPath {
+    const char *candidates[] = {
+        ROOT_PATH("/usr/bin/ldid"),
+        "/var/jb/usr/bin/ldid",
+        "/usr/bin/ldid",
+        ROOT_PATH("/usr/local/bin/ldid"),
+        "/usr/local/bin/ldid"
+    };
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        if (access(candidates[i], X_OK) == 0) {
+            return candidates[i];
+        }
+    }
+    return NULL;
+}
+
 + (BOOL)resignAppBundleAtPath:(NSString *)bundlePath withEntitlements:(NSString *)entitlementsPath error:(NSError **)error {
+    const char *ldidPath = [self findLdidPath];
+    if (!ldidPath) {
+        if (error) *error = [self errorWithCode:404 message:@"ldid not found. Please install ldid from Sileo/Zebra."];
+        return NO;
+    }
+
     NSFileManager *fm = [NSFileManager defaultManager];
     
     if (![fm fileExistsAtPath:bundlePath]) {
@@ -85,8 +107,64 @@ extern char **environ;
     return [self executeLdidOnPath:mainExecutable withEntitlements:entitlementsPath error:error];
 }
 
++ (BOOL)repackPayloadAtDirectory:(NSString *)sourceDir toIPA:(NSString *)destinationIPA error:(NSError **)error {
+    const char *zipPaths[] = {
+        ROOT_PATH("/usr/bin/zip"),
+        "/var/jb/usr/bin/zip",
+        "/usr/bin/zip"
+    };
+    const char *foundZip = NULL;
+    for (size_t i = 0; i < sizeof(zipPaths) / sizeof(zipPaths[0]); i++) {
+        if (access(zipPaths[i], X_OK) == 0) {
+            foundZip = zipPaths[i];
+            break;
+        }
+    }
+    
+    if (!foundZip) {
+        if (error) *error = [self errorWithCode:404 message:@"zip binary not found."];
+        return NO;
+    }
+    
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    
+    pid_t pid;
+    char *argv[] = {
+        (char *)foundZip,
+        (char *)"-qr",
+        (char *)destinationIPA.fileSystemRepresentation,
+        (char *)"Payload",
+        NULL
+    };
+    
+    char cwd[PATH_MAX];
+    if (getcwd(cwd, sizeof(cwd)) != NULL) {
+        chdir(sourceDir.fileSystemRepresentation);
+    }
+    
+    int spawnError = posix_spawn(&pid, foundZip, &actions, NULL, argv, environ);
+    if (cwd[0] != '\0') {
+        chdir(cwd);
+    }
+    posix_spawn_file_actions_destroy(&actions);
+    
+    if (spawnError != 0) {
+        if (error) *error = [self errorWithCode:spawnError message:@"posix_spawn failed for zip"];
+        return NO;
+    }
+    
+    int status;
+    waitpid(pid, &status, 0);
+    return (WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 + (NSString *)extractEntitlementsFromPath:(NSString *)targetPath error:(NSError **)error {
-    const char *ldidPath = ROOT_PATH("/usr/bin/ldid");
+    const char *ldidPath = [self findLdidPath];
+    if (!ldidPath) {
+        if (error) *error = [self errorWithCode:404 message:@"ldid not found for entitlement extraction."];
+        return nil;
+    }
     
     int pipefd[2];
     if (pipe(pipefd) != 0) {
