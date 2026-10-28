@@ -322,8 +322,8 @@ public final class AppleSessionManager: NSObject {
             request.setValue("en-us", forHTTPHeaderField: "Accept-Language")
             request.setValue("akd/1.0 CFNetwork Darwin", forHTTPHeaderField: "User-Agent")
             request.setValue(identityToken, forHTTPHeaderField: "X-Apple-Identity-Token")
-            request.setValue("com.apple.gs.xcode.auth", forHTTPHeaderField: "X-Apple-App-Info")
-            request.setValue("27.0 (27A5218g)", forHTTPHeaderField: "X-Xcode-Version")
+            request.setValue(Self.xcodeAppInfo, forHTTPHeaderField: "X-Apple-App-Info")
+            request.setValue(Self.xcodeVersion, forHTTPHeaderField: "X-Xcode-Version")
             request.setValue(dsid, forHTTPHeaderField: "X-Apple-I-DSID")
             request.setValue("close", forHTTPHeaderField: "Connection")
 
@@ -378,8 +378,8 @@ public final class AppleSessionManager: NSObject {
         getReq.setValue("text/x-xml-plist", forHTTPHeaderField: "Content-Type")
         getReq.setValue("text/x-xml-plist", forHTTPHeaderField: "Accept")
         getReq.setValue(identityToken, forHTTPHeaderField: "X-Apple-Identity-Token")
-        getReq.setValue("com.apple.gs.xcode.auth", forHTTPHeaderField: "X-Apple-App-Info")
-        getReq.setValue("27.0 (27A5218g)", forHTTPHeaderField: "X-Xcode-Version")
+        getReq.setValue(Self.xcodeAppInfo, forHTTPHeaderField: "X-Apple-App-Info")
+        getReq.setValue(Self.xcodeVersion, forHTTPHeaderField: "X-Xcode-Version")
         getReq.setValue(dsid, forHTTPHeaderField: "X-Apple-I-DSID")
 
         for (k, v) in anisette { getReq.setValue(v, forHTTPHeaderField: k) }
@@ -448,6 +448,7 @@ public final class AppleSessionManager: NSObject {
             "checksum": checksum,
             "cpd": makeClientDictionary(anisette: anisette),
             "o": "apptokens",
+            "svct": "iCloud",
             "t": idmsToken,
             "u": u
         ]
@@ -458,13 +459,20 @@ public final class AppleSessionManager: NSObject {
 
         do {
             let response = try sendGrandSlamRequest(parameters: params, anisette: anisette)
-            guard let encryptedToken = response["et"] as? Data else {
+            var encryptedToken: Data? = nil
+            if let d = response["et"] as? Data {
+                encryptedToken = d
+            } else if let s = response["et"] as? String {
+                encryptedToken = Data(base64Encoded: s) ?? Data(s.utf8)
+            }
+
+            guard let et = encryptedToken else {
                 ContraAuthLog.shared.log(tag: "GSA-HTTP", "⚠️ No encrypted token 'et' found in apptokens response")
                 return nil
             }
 
-            let (token, _) = try ContraSRPClient.decryptAppToken(encryptedToken: encryptedToken, sessionKey: sessionKey, targetApp: targetApp)
-            ContraAuthLog.shared.log(tag: "GSA-HTTP", "✅ Successfully decrypted Xcode AppToken (myacinfo): \(token.prefix(20))...")
+            let (token, _) = try ContraSRPClient.decryptAppToken(encryptedToken: et, sessionKey: sessionKey, targetApp: targetApp)
+            ContraAuthLog.shared.log(tag: "GSA-HTTP", "✅ Successfully decrypted Xcode AppToken (myacinfo): \(token.prefix(25))...")
             return token
         } catch {
             ContraAuthLog.shared.log(tag: "GSA-HTTP", "❌ Failed to fetch apptoken: \(error.localizedDescription)")
@@ -477,6 +485,7 @@ public final class AppleSessionManager: NSObject {
     private func resolveDeveloperTeams(
         appleID: String,
         dsid: String,
+        adsid: String = "",
         token: String,
         anisette: [String: String]
     ) -> (primaryTeamID: String, primaryTeamName: String, allTeams: [[String: Any]]) {
@@ -486,6 +495,7 @@ public final class AppleSessionManager: NSObject {
             return (dsid, "Personal Team (\(appleID))", [])
         }
 
+        let idToUse = !adsid.isEmpty ? adsid : dsid
         var parsedTeams: [[String: Any]] = []
 
         for attempt in 1...2 {
@@ -495,9 +505,10 @@ public final class AppleSessionManager: NSObject {
             request.setValue("text/x-xml-plist", forHTTPHeaderField: "Accept")
             request.setValue("Xcode", forHTTPHeaderField: "User-Agent")
             request.setValue("en-us", forHTTPHeaderField: "Accept-Language")
-            request.setValue("com.apple.gs.xcode.auth", forHTTPHeaderField: "X-Apple-App-Info")
-            request.setValue("14.2 (14C18)", forHTTPHeaderField: "X-Xcode-Version")
-            request.setValue(dsid, forHTTPHeaderField: "X-Apple-I-Identity-Id")
+            request.setValue(Self.xcodeAppInfo, forHTTPHeaderField: "X-Apple-App-Info")
+            request.setValue(Self.xcodeVersion, forHTTPHeaderField: "X-Xcode-Version")
+            request.setValue(idToUse, forHTTPHeaderField: "X-Apple-I-Identity-Id")
+            request.setValue(Data(idToUse.utf8).base64EncodedString(), forHTTPHeaderField: "X-Apple-I-MD-LU")
             request.setValue(token, forHTTPHeaderField: "X-Apple-GS-Token")
             request.setValue("close", forHTTPHeaderField: "Connection")
 
@@ -510,13 +521,16 @@ public final class AppleSessionManager: NSObject {
             }
 
             // Standard Apple Developer Portal request body
-            let bodyPlist: [String: Any] = [
+            // Attempt 1 follows Fortiva standard without myacinfo body; Attempt 2 includes myacinfo as fallback
+            var bodyPlist: [String: Any] = [
                 "clientId": "XABBG36SBA",
-                "myacinfo": token,
                 "protocolVersion": "QH65B2",
                 "requestId": UUID().uuidString.uppercased(),
                 "userLocale": ["en_US"]
             ]
+            if attempt == 2 {
+                bodyPlist["myacinfo"] = token
+            }
 
             request.httpBody = try? PropertyListSerialization.data(fromPropertyList: bodyPlist, format: .xml, options: 0)
 
@@ -540,18 +554,18 @@ public final class AppleSessionManager: NSObject {
                 let wrappedData = ContraSRPClient.ensurePlistWrapper(rawData)
                 if let plist = (try? PropertyListSerialization.propertyList(from: wrappedData, options: [], format: nil)) as? [String: Any] {
                     let resultCode = plist["resultCode"] as? Int ?? (plist["resultcode"] as? Int ?? 0)
-                    let userString = plist["userString"] as? String ?? ""
+                    let userString = plist["userString"] as? String ?? (plist["resultString"] as? String ?? "")
 
                     if resultCode != 0 {
-                        ContraAuthLog.shared.log(tag: "DEV-TEAM", "Developer API Notice (code \(resultCode)): '\(userString)'")
+                        ContraAuthLog.shared.log(tag: "DEV-TEAM", "Developer API Notice (code \(resultCode)): '\(userString)' - keys: \(plist.keys.joined(separator: ", "))")
                     }
 
                     if let rawTeams = plist["teams"] as? [[String: Any]] {
                         for t in rawTeams {
-                            let tid = t["teamId"] as? String ?? (t["teamID"] as? String ?? "")
-                            let tname = t["name"] as? String ?? ""
-                            let ttype = t["type"] as? String ?? "Individual"
-                            let tstatus = t["status"] as? String ?? "active"
+                            let tid = (t["teamId"] as? String) ?? (t["teamID"] as? String ?? "")
+                            let tname = (t["name"] as? String) ?? (t["teamName"] as? String ?? "")
+                            let ttype = (t["type"] as? String) ?? "Individual"
+                            let tstatus = (t["status"] as? String) ?? "active"
 
                             if !tid.isEmpty {
                                 ContraAuthLog.shared.log(tag: "DEV-TEAM", "✅ Found Team: '\(tname)' [TeamID: \(tid), Type: \(ttype), Status: \(tstatus)]")
@@ -597,7 +611,7 @@ public final class AppleSessionManager: NSObject {
         }
 
         // Fallback for Free Developer Apple ID accounts (without enrolled organization team)
-        let fallbackID = dsid.isEmpty ? "Personal" : dsid
+        let fallbackID = idToUse.isEmpty ? (dsid.isEmpty ? "Personal" : dsid) : idToUse
         let fallbackName = "\(appleID) (Personal)"
         ContraAuthLog.shared.log(tag: "DEV-TEAM", "ℹ️ Free/Personal account detected. Assigning Personal Team [ID: \(fallbackID)]")
         return (fallbackID, fallbackName, parsedTeams)
@@ -778,6 +792,7 @@ public final class AppleSessionManager: NSObject {
                 let teamResolution = self.resolveDeveloperTeams(
                     appleID: sanitizedAppleID,
                     dsid: dsid,
+                    adsid: adsid,
                     token: finalToken,
                     anisette: anisette
                 )
@@ -835,8 +850,8 @@ public final class AppleSessionManager: NSObject {
             request.setValue("text/x-xml-plist", forHTTPHeaderField: "Content-Type")
             request.setValue("text/x-xml-plist", forHTTPHeaderField: "Accept")
             request.setValue("akd/1.0 CFNetwork Darwin", forHTTPHeaderField: "User-Agent")
-            request.setValue("com.apple.gs.xcode.auth", forHTTPHeaderField: "X-Apple-App-Info")
-            request.setValue("27.0 (27A5218g)", forHTTPHeaderField: "X-Xcode-Version")
+            request.setValue(Self.xcodeAppInfo, forHTTPHeaderField: "X-Apple-App-Info")
+            request.setValue(Self.xcodeVersion, forHTTPHeaderField: "X-Xcode-Version")
             request.setValue(identityToken, forHTTPHeaderField: "X-Apple-Identity-Token")
             request.setValue(context.dsid, forHTTPHeaderField: "X-Apple-I-DSID")
             request.setValue(cleanCode, forHTTPHeaderField: "security-code")
@@ -927,6 +942,7 @@ public final class AppleSessionManager: NSObject {
             let teamResolution = self.resolveDeveloperTeams(
                 appleID: context.appleID,
                 dsid: context.dsid,
+                adsid: context.adsid,
                 token: finalToken,
                 anisette: context.anisetteHeaders
             )
