@@ -140,7 +140,25 @@ public enum ContraCrypto {
         return output
     }
 
-    /// Decrypts ciphertext with AES-GCM using key, nonce, aad, and tag via CryptoKit
+#if canImport(CommonCrypto)
+@_silgen_name("CCCryptorGCMOneshotDecrypt")
+private func ccmGCMDecrypt(
+    _ alg: UInt32,
+    _ key: UnsafeRawPointer?,
+    _ keyLength: Int,
+    _ iv: UnsafeRawPointer?,
+    _ ivLen: Int,
+    _ aData: UnsafeRawPointer?,
+    _ aDataLen: Int,
+    _ dataIn: UnsafeRawPointer?,
+    _ dataInLen: Int,
+    _ dataOut: UnsafeMutableRawPointer?,
+    _ tag: UnsafeRawPointer?,
+    _ tagLen: Int
+) -> Int32
+#endif
+
+    /// Decrypts ciphertext with AES-GCM using key, nonce (12 or 16 bytes), aad, and tag via CommonCrypto / CryptoKit
     public static func aesGCMDecrypt(
         key: Data,
         nonce: Data,
@@ -149,19 +167,56 @@ public enum ContraCrypto {
         tag: Data
     ) -> Data? {
         guard key.count == 16 || key.count == 24 || key.count == 32 else { return nil }
-        guard let gcmNonce = try? AES.GCM.Nonce(data: nonce) else { return nil }
         guard tag.count == 16 else { return nil }
 
-        do {
-            let sealedBox = try AES.GCM.SealedBox(nonce: gcmNonce, ciphertext: ciphertext, tag: tag)
-            let symmetricKey = SymmetricKey(data: key)
-            if aad.isEmpty {
-                return try AES.GCM.open(sealedBox, using: symmetricKey)
-            } else {
-                return try AES.GCM.open(sealedBox, using: symmetricKey, authenticating: aad)
+        #if canImport(CommonCrypto)
+        var decrypted = Data(count: ciphertext.count)
+        let status = decrypted.withUnsafeMutableBytes { outBuf -> Int32 in
+            ciphertext.withUnsafeBytes { cipherBuf -> Int32 in
+                key.withUnsafeBytes { keyBuf -> Int32 in
+                    nonce.withUnsafeBytes { nonceBuf -> Int32 in
+                        aad.withUnsafeBytes { aadBuf -> Int32 in
+                            tag.withUnsafeBytes { tagBuf -> Int32 in
+                                ccmGCMDecrypt(
+                                    0, // kCCAlgorithmAES
+                                    keyBuf.baseAddress,
+                                    key.count,
+                                    nonceBuf.baseAddress,
+                                    nonce.count,
+                                    aad.isEmpty ? nil : aadBuf.baseAddress,
+                                    aad.count,
+                                    cipherBuf.baseAddress,
+                                    ciphertext.count,
+                                    outBuf.baseAddress,
+                                    tagBuf.baseAddress,
+                                    tag.count
+                                )
+                            }
+                        }
+                    }
+                }
             }
-        } catch {
-            return nil
         }
+        if status == 0 {
+            return decrypted
+        }
+        #endif
+
+        // Fallback to CryptoKit if nonce is 12 bytes
+        if nonce.count == 12, let gcmNonce = try? AES.GCM.Nonce(data: nonce) {
+            do {
+                let sealedBox = try AES.GCM.SealedBox(nonce: gcmNonce, ciphertext: ciphertext, tag: tag)
+                let symmetricKey = SymmetricKey(data: key)
+                if aad.isEmpty {
+                    return try AES.GCM.open(sealedBox, using: symmetricKey)
+                } else {
+                    return try AES.GCM.open(sealedBox, using: symmetricKey, authenticating: aad)
+                }
+            } catch {
+                return nil
+            }
+        }
+
+        return nil
     }
 }

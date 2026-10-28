@@ -8,11 +8,37 @@
 import Foundation
 
 public struct DecryptedSPD: @unchecked Sendable {
+    public let adsid: String
     public let dsid: String
     public let idmsToken: String
-    public let sessionKey: Data
-    public let challengeToken: Data?
+    public let sessionMasterKey: Data
+    public var sessionKey: Data { sessionMasterKey }
+    public let rawChallenge: Any?
+    public var challengeToken: Data? {
+        if let d = rawChallenge as? Data { return d }
+        if let s = rawChallenge as? String { return Data(base64Encoded: s) ?? Data(s.utf8) }
+        return nil
+    }
+    public let preExistingXcodeToken: String?
     public let rawDictionary: [String: Any]
+
+    public init(
+        adsid: String,
+        dsid: String,
+        idmsToken: String,
+        sessionMasterKey: Data,
+        rawChallenge: Any?,
+        preExistingXcodeToken: String?,
+        rawDictionary: [String: Any]
+    ) {
+        self.adsid = adsid
+        self.dsid = dsid
+        self.idmsToken = idmsToken
+        self.sessionMasterKey = sessionMasterKey
+        self.rawChallenge = rawChallenge
+        self.preExistingXcodeToken = preExistingXcodeToken
+        self.rawDictionary = rawDictionary
+    }
 }
 
 public final class ContraSRPClient {
@@ -170,6 +196,24 @@ public final class ContraSRPClient {
         return self.bnK
     }
 
+    /// Wraps raw plist XML dictionary in standard plist header and footer if missing
+    public static func ensurePlistWrapper(_ data: Data) -> Data {
+        guard let firstNonWhitespace = data.firstIndex(where: { $0 != 0x20 && $0 != 0x09 && $0 != 0x0A && $0 != 0x0D }) else {
+            return data
+        }
+        let prefix = data[firstNonWhitespace...]
+        if prefix.starts(with: [0x3C, 0x3F, 0x78, 0x6D, 0x6C]) /* <?xml */ ||
+           prefix.starts(with: [0x62, 0x70, 0x6C, 0x69, 0x73, 0x74]) /* bplist */ {
+            return data
+        }
+        let header = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n"
+        let footer = "\n</plist>"
+        var out = Data(header.utf8)
+        out.append(data)
+        out.append(Data(footer.utf8))
+        return out
+    }
+
     /// Decrypts AES-CBC encrypted SPD payload from GrandSlam complete response.
     public func decryptSPD(_ spd: Data) throws -> DecryptedSPD {
         guard let k = self.bnK else {
@@ -183,13 +227,14 @@ public final class ContraSRPClient {
             throw NSError(domain: "com.kurishu.contra", code: -2, userInfo: [NSLocalizedDescriptionKey: "Failed to AES-CBC decrypt SPD payload."])
         }
 
-        guard let plist = try? PropertyListSerialization.propertyList(from: decrypted, options: [], format: nil) as? [String: Any] else {
+        let wrapped = Self.ensurePlistWrapper(decrypted)
+        guard let plist = try? PropertyListSerialization.propertyList(from: wrapped, options: [], format: nil) as? [String: Any] else {
             throw NSError(domain: "com.kurishu.contra", code: -3, userInfo: [NSLocalizedDescriptionKey: "SPD decrypted payload is not a valid property list."])
         }
 
-        let adsid = plist["adsid"] as? String
-        let dsidString = (plist["dsid"] as? CustomStringConvertible)?.description
-        guard let dsid = adsid ?? dsidString else {
+        let adsidStr = (plist["adsid"] as? CustomStringConvertible)?.description
+        let dsidStr = (plist["dsid"] as? CustomStringConvertible)?.description
+        guard let dsid = adsidStr ?? dsidStr else {
             throw NSError(domain: "com.kurishu.contra", code: -4, userInfo: [NSLocalizedDescriptionKey: "SPD missing adsid/dsid."])
         }
 
@@ -199,14 +244,34 @@ public final class ContraSRPClient {
             throw NSError(domain: "com.kurishu.contra", code: -5, userInfo: [NSLocalizedDescriptionKey: "SPD missing GsIdmsToken."])
         }
 
-        let sk = plist["sk"] as? Data ?? Data()
-        let c = plist["c"] as? Data
+        // Flexible sk extraction (Data, base64 String, or fallback to K)
+        var skData: Data = Data()
+        if let d = plist["sk"] as? Data, !d.isEmpty {
+            skData = d
+        } else if let s = plist["sk"] as? String, !s.isEmpty {
+            skData = Data(base64Encoded: s) ?? Data(s.utf8)
+        }
+        if skData.isEmpty {
+            skData = k
+        }
+
+        let c = plist["c"]
+
+        // Pre-existing Xcode token in 't' -> 'com.apple.gs.xcode.auth' -> 'token'
+        var existingXcodeToken: String? = nil
+        if let tDict = plist["t"] as? [String: Any],
+           let xcodeDict = tDict["com.apple.gs.xcode.auth"] as? [String: Any],
+           let tok = xcodeDict["token"] as? String, !tok.isEmpty {
+            existingXcodeToken = tok
+        }
 
         return DecryptedSPD(
+            adsid: adsidStr ?? dsid,
             dsid: dsid,
             idmsToken: token,
-            sessionKey: sk,
-            challengeToken: c,
+            sessionMasterKey: skData,
+            rawChallenge: c,
+            preExistingXcodeToken: existingXcodeToken,
             rawDictionary: plist
         )
     }
@@ -230,7 +295,8 @@ public final class ContraSRPClient {
             throw NSError(domain: "com.kurishu.contra", code: -7, userInfo: [NSLocalizedDescriptionKey: "Failed to AES-GCM decrypt application token."])
         }
 
-        guard let plist = try? PropertyListSerialization.propertyList(from: decrypted, options: [], format: nil) as? [String: Any],
+        let wrapped = ensurePlistWrapper(decrypted)
+        guard let plist = try? PropertyListSerialization.propertyList(from: wrapped, options: [], format: nil) as? [String: Any],
               let appTokens = plist["t"] as? [String: Any],
               let tokenDict = appTokens[targetApp] as? [String: Any],
               let token = tokenDict["token"] as? String
