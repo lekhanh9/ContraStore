@@ -10,6 +10,24 @@ import Foundation
 import CryptoKit
 import CommonCrypto
 
+#if canImport(CommonCrypto)
+@_silgen_name("CCCryptorGCMOneshotDecrypt")
+private func ccmGCMDecrypt(
+    _ alg: UInt32,
+    _ key: UnsafeRawPointer?,
+    _ keyLength: Int,
+    _ iv: UnsafeRawPointer?,
+    _ ivLen: Int,
+    _ aData: UnsafeRawPointer?,
+    _ aDataLen: Int,
+    _ dataIn: UnsafeRawPointer?,
+    _ dataInLen: Int,
+    _ dataOut: UnsafeMutableRawPointer?,
+    _ tag: UnsafeRawPointer?,
+    _ tagLen: Int
+) -> Int32
+#endif
+
 public enum ContraCrypto {
 
     /// Computes HMAC-SHA256 over raw Data
@@ -139,24 +157,6 @@ public enum ContraCrypto {
         output.count = numBytesEncrypted
         return output
     }
-
-#if canImport(CommonCrypto)
-@_silgen_name("CCCryptorGCMOneshotDecrypt")
-private func ccmGCMDecrypt(
-    _ alg: UInt32,
-    _ key: UnsafeRawPointer?,
-    _ keyLength: Int,
-    _ iv: UnsafeRawPointer?,
-    _ ivLen: Int,
-    _ aData: UnsafeRawPointer?,
-    _ aDataLen: Int,
-    _ dataIn: UnsafeRawPointer?,
-    _ dataInLen: Int,
-    _ dataOut: UnsafeMutableRawPointer?,
-    _ tag: UnsafeRawPointer?,
-    _ tagLen: Int
-) -> Int32
-#endif
 
     /// Decrypts ciphertext with AES-GCM using key, nonce (12 or 16 bytes), aad, and tag via CommonCrypto / CryptoKit
     public static func aesGCMDecrypt(

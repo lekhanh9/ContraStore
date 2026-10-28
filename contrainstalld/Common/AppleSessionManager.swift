@@ -74,6 +74,9 @@ public final class ContraAuthLog: @unchecked Sendable {
 public final class AppleSessionManager: NSObject {
     public static let shared = AppleSessionManager()
 
+    public static let xcodeVersion = "14.2 (14C18)"
+    public static let xcodeAppInfo = "com.apple.gs.xcode.auth"
+
     private let queue = DispatchQueue(label: "com.kurishu.contrainstalld.appleAuthQueue", qos: .userInitiated)
 
     // In-memory 2FA context while waiting for user to submit 6-digit code
